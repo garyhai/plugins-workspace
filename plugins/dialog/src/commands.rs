@@ -25,8 +25,8 @@ pub enum OpenResponse {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct DialogFilter {
     name: String,
     extensions: Vec<String>,

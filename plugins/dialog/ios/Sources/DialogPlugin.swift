@@ -39,7 +39,6 @@ struct SaveFileDialogOptions: Decodable {
 }
 
 class DialogPlugin: Plugin {
-
   var filePickerController: FilePickerController!
   var onFilePickerResult: ((FilePickerEvent) -> Void)? = nil
 
@@ -52,50 +51,45 @@ class DialogPlugin: Plugin {
     let args = try invoke.parseArgs(FilePickerOptions.self)
 
     let parsedTypes = parseFiltersOption(args.filters ?? [])
+    Logger.error("Parsed Types: %@", parsedTypes)
 
-    var isMedia = !parsedTypes.isEmpty
-    var uniqueMimeType: Bool? = nil
-    var mimeKind: String? = nil
-    if !parsedTypes.isEmpty {
-      uniqueMimeType = true
-      for mime in parsedTypes {
-        let kind = mime.components(separatedBy: "/")[0]
-        if kind != "image" && kind != "video" {
-          isMedia = false
-        }
-        if mimeKind == nil {
-          mimeKind = kind
-        } else if mimeKind != kind {
-          uniqueMimeType = false
-        }
+    var hasImage = false
+    var hasVideo = false
+    var hasFile = false
+
+    for type in parsedTypes {
+      let kind = kindOfMedia(type)
+      if kind == "file" {
+        hasFile = true
+        break
+      } else if kind == "image" {
+        hasImage = true
+      } else if kind == "video" {
+        hasVideo = true
       }
     }
 
-    onFilePickerResult = { (event: FilePickerEvent) -> Void in
+    onFilePickerResult = { (event: FilePickerEvent) in
       switch event {
-      case .selected(let urls):
+      case let .selected(urls):
         invoke.resolve(["files": urls])
       case .cancelled:
         invoke.resolve(["files": nil])
-      case .error(let error):
+      case let .error(error):
         invoke.reject(error)
       }
     }
 
-    if uniqueMimeType == true || isMedia {
+    if !hasFile {
       DispatchQueue.main.async {
         if #available(iOS 14, *) {
           var configuration = PHPickerConfiguration(photoLibrary: PHPhotoLibrary.shared())
           configuration.selectionLimit = (args.multiple ?? false) ? 0 : 1
-
-          if uniqueMimeType == true {
-            if mimeKind == "image" {
-              configuration.filter = .images
-            } else if mimeKind == "video" {
-              configuration.filter = .videos
-            }
+          if hasImage && !hasVideo {
+            configuration.filter = .images
+          } else if hasVideo && !hasImage {
+            configuration.filter = .videos
           }
-
           let picker = PHPickerViewController(configuration: configuration)
           picker.delegate = self.filePickerController
           picker.modalPresentationStyle = .fullScreen
@@ -104,8 +98,12 @@ class DialogPlugin: Plugin {
           let picker = UIImagePickerController()
           picker.delegate = self.filePickerController
 
-          if uniqueMimeType == true && mimeKind == "image" {
-            picker.sourceType = .photoLibrary
+          if hasImage && hasVideo {
+            picker.mediaTypes = [kUTTypeImage as String, kUTTypeMovie as String]
+          } else if hasImage {
+            picker.mediaTypes = [kUTTypeImage as String]
+          } else if hasVideo {
+            picker.mediaTypes = [kUTTypeMovie as String]
           }
 
           picker.sourceType = .photoLibrary
@@ -146,13 +144,13 @@ class DialogPlugin: Plugin {
       try "".write(to: srcPath, atomically: true, encoding: .utf8)
     }
 
-    onFilePickerResult = { (event: FilePickerEvent) -> Void in
+    onFilePickerResult = { (event: FilePickerEvent) in
       switch event {
-      case .selected(let urls):
+      case let .selected(urls):
         invoke.resolve(["file": urls.first!])
       case .cancelled:
         invoke.resolve(["file": nil])
-      case .error(let error):
+      case let .error(error):
         invoke.reject(error)
       }
     }
@@ -169,27 +167,56 @@ class DialogPlugin: Plugin {
   }
 
   private func presentViewController(_ viewControllerToPresent: UIViewController) {
-    self.manager.viewController?.present(viewControllerToPresent, animated: true, completion: nil)
+    manager.viewController?.present(viewControllerToPresent, animated: true, completion: nil)
   }
 
   private func parseFiltersOption(_ filters: [Filter]) -> [String] {
     var parsedTypes: [String] = []
     for filter in filters {
       for ext in filter.extensions ?? [] {
-        guard
-          let utType: String = UTTypeCreatePreferredIdentifierForTag(
-            kUTTagClassMIMEType, ext as CFString, nil)?.takeRetainedValue() as String?
-        else {
-          continue
+        if #available(iOS 14.0, *) {
+          if let utType = UTType(filenameExtension: ext) {
+            parsedTypes.append(utType.identifier)
+          }
+        } else {
+          if let unmanagedUTI = UTTypeCreatePreferredIdentifierForTag(
+            kUTTagClassFilenameExtension,
+            ext as CFString,
+            nil
+          ) {
+            let uti = unmanagedUTI.takeRetainedValue() as String
+            parsedTypes.append(uti)
+          }
         }
-        parsedTypes.append(utType)
       }
     }
     return parsedTypes
   }
 
+  private func kindOfMedia(_ uti: String) -> String {
+    if #available(iOS 14.0, *) {
+      let utType = UTType(uti)
+      if utType?.conforms(to: .image) == true {
+        return "image"
+      } else if utType?.conforms(to: .movie) == true {
+        return "video"
+      } else if utType?.conforms(to: .video) == true {
+        return "video"
+      }
+    } else {
+      if UTTypeConformsTo(uti as CFString, kUTTypeImage) {
+        return "image"
+      } else if UTTypeConformsTo(uti as CFString, kUTTypeMovie) {
+        return "video"
+      } else if UTTypeConformsTo(uti as CFString, kUTTypeVideo) {
+        return "video"
+      }
+    }
+    return "file"
+  }
+
   public func onFilePickerEvent(_ event: FilePickerEvent) {
-    self.onFilePickerResult?(event)
+    onFilePickerResult?(event)
   }
 
   @objc public func showMessageDialog(_ invoke: Invoke) throws {
@@ -198,21 +225,23 @@ class DialogPlugin: Plugin {
 
     DispatchQueue.main.async { [] in
       let alert = UIAlertController(
-        title: args.title, message: args.message, preferredStyle: UIAlertController.Style.alert)
+        title: args.title, message: args.message, preferredStyle: UIAlertController.Style.alert
+      )
 
       let cancelButtonLabel = args.cancelButtonLabel ?? ""
       if !cancelButtonLabel.isEmpty {
         alert.addAction(
           UIAlertAction(
             title: cancelButtonLabel, style: UIAlertAction.Style.default,
-            handler: { (_) -> Void in
+            handler: { _ in
               Logger.error("cancel")
 
               invoke.resolve([
                 "value": false,
                 "cancelled": false,
               ])
-            }))
+            }
+          ))
       }
 
       let okButtonLabel = args.okButtonLabel ?? (cancelButtonLabel.isEmpty ? "OK" : "")
@@ -220,14 +249,15 @@ class DialogPlugin: Plugin {
         alert.addAction(
           UIAlertAction(
             title: okButtonLabel, style: UIAlertAction.Style.default,
-            handler: { (_) -> Void in
+            handler: { _ in
               Logger.error("ok")
 
               invoke.resolve([
                 "value": true,
                 "cancelled": false,
               ])
-            }))
+            }
+          ))
       }
 
       manager.viewController?.present(alert, animated: true, completion: nil)
